@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rewards Data Pipeline</title>
+<style>
+  :root { --bg:#f7f7f5; --card:#fff; --ink:#1d1d1f; --muted:#6b6b70; --line:#e4e4e0; --accent:#2f6fde; --ok:#1f8a4c; --warn:#b7791f; --bad:#c53030; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#141416; --card:#1d1d20; --ink:#ececef; --muted:#9a9aa2; --line:#2c2c31; --accent:#6c9cff; } }
+  * { box-sizing:border-box } body { margin:0; font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif; background:var(--bg); color:var(--ink) }
+  header { padding:20px 16px 8px; max-width:1100px; margin:auto } h1 { margin:0; font-size:20px } header p { margin:4px 0 0; color:var(--muted) }
+  main { max-width:1100px; margin:auto; padding:8px 16px 40px; display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)) }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px } .card h2 { margin:0 0 10px; font-size:14px }
+  .kpis { grid-column:1/-1; display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px }
+  .kpi b { display:block; font-size:22px; font-variant-numeric:tabular-nums } .kpi span { color:var(--muted); font-size:12px }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums } td,th { padding:5px 4px; border-bottom:1px solid var(--line); text-align:left; font-size:13px } th { color:var(--muted); font-weight:500 }
+  .bar { height:8px; background:var(--accent); border-radius:4px } .pill { padding:1px 7px; border-radius:9px; font-size:12px; color:#fff }
+  .pass { background:var(--ok) } .warn { background:var(--warn) } .fail,.error { background:var(--bad) }
+  button { background:var(--accent); color:#fff; border:0; border-radius:7px; padding:8px 12px; font-weight:600; cursor:pointer } button:disabled { opacity:.5 }
+  code { font-size:12px } .wide { grid-column:1/-1 } .muted { color:var(--muted) } svg text { fill:var(--muted); font-size:10px }
+</style>
+</head>
+<body>
+<header>
+  <h1>Rewards Data Pipeline</h1>
+  <p>Ingestion API → partitioned log → consumer (offsets) → raw → dbt-style models → data-quality checks. <a href="/docs">API docs</a></p>
+</header>
+<main>
+  <section class="kpis" id="kpis"></section>
+  <section class="card wide">
+    <h2>Run the pipeline</h2>
+    <button id="run">Simulate 500 new events &amp; run</button>
+    <span id="runout" class="muted" style="margin-left:10px"></span>
+  </section>
+  <section class="card wide"><h2>Daily payouts (mart_advertiser_daily)</h2><div id="daily"></div></section>
+  <section class="card"><h2>Advertisers, last 7 days</h2><div id="adv"></div></section>
+  <section class="card"><h2>Offer funnel (top 10)</h2><div id="funnel"></div></section>
+  <section class="card"><h2>Data-quality checks</h2><div id="quality"></div></section>
+  <section class="card"><h2>Lineage (run order)</h2><div id="lineage"></div></section>
+  <section class="card wide"><h2>Recent pipeline runs</h2><div id="runs"></div></section>
+  <section class="card wide"><h2>Dead-letter queue (latest)</h2><div id="dlq"></div></section>
+</main>
+<script>
+const eur = c => (c/100).toLocaleString('en', {style:'currency', currency:'EUR'});
+const j = async (u, o) => (await fetch(u, o)).json();
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const table = (rows, cols) => '<table><tr>' + cols.map(c => `<th>${c[0]}</th>`).join('') + '</tr>' +
+  rows.map(r => '<tr>' + cols.map(c => `<td>${c[1](r)}</td>`).join('') + '</tr>').join('') + '</table>';
+
+async function load() {
+  const [h, adv, daily, fun, q, lin, runs, dlq, lag] = await Promise.all(
+    ['/health','/marts/advertisers','/marts/daily','/marts/funnel','/quality','/lineage','/runs?limit=8','/dead-letters?limit=6','/stream/lag'].map(u => j(u)));
+  const payout = adv.reduce((s, r) => s + r.payout_cents, 0);
+  const lagSum = Object.values(lag).reduce((a, b) => a + b, 0);
+  document.getElementById('kpis').innerHTML = [
+    ['Raw events', h.raw_events.toLocaleString()], ['Payout, 7 days', eur(payout)],
+    ['Consumer lag', lagSum], ['Quality', q.passed ? 'passing' : 'FAILING'], ['Dead letters shown', dlq.length]
+  ].map(([k, v]) => `<div class="card kpi"><b>${v}</b><span>${k}</span></div>`).join('');
+
+  const max = Math.max(...daily.map(d => d.payout_cents), 1), W = 1000, H = 160, bw = W / Math.max(daily.length, 1);
+  document.getElementById('daily').innerHTML = `<svg viewBox="0 0 ${W} ${H + 18}" width="100%" role="img" aria-label="Daily payouts">` +
+    daily.map((d, i) => { const h2 = d.payout_cents / max * H;
+      return `<rect x="${i*bw+4}" y="${H-h2}" width="${bw-8}" height="${h2}" rx="3" fill="var(--accent)"><title>${d.event_date}: ${eur(d.payout_cents)}</title></rect>` +
+             `<text x="${i*bw+bw/2}" y="${H+13}" text-anchor="middle">${d.event_date.slice(5)}</text>`; }).join('') + '</svg>';
+
+  const amax = Math.max(...adv.map(a => a.payout_cents), 1);
+  document.getElementById('adv').innerHTML = table(adv, [['Advertiser', r => esc(r.advertiser)], ['Payout', r => eur(r.payout_cents)],
+    ['', r => `<div class="bar" style="width:${r.payout_cents/amax*100}%"></div>`], ['Users', r => r.paying_users]]);
+  document.getElementById('funnel').innerHTML = table(fun, [['Offer', r => esc(r.offer_id)], ['Clicks', r => r.clickers],
+    ['Completes', r => r.completers], ['Paid', r => r.paid_users], ['CVR', r => ((r.click_to_complete||0)*100).toFixed(1)+'%']]);
+  document.getElementById('quality').innerHTML = table(q.checks, [['Check', r => esc(r.name)],
+    ['Bad rows', r => r.bad_rows ?? '–'], ['', r => `<span class="pill ${r.status.split(':')[0]}">${esc(r.status.split(':')[0])}</span>`]]);
+  document.getElementById('lineage').innerHTML = '<ol>' + lin.order.map(n => `<li><code>${n}</code> <span class="muted">${lin.materializations[n] || 'source'}</span></li>`).join('') + '</ol>';
+  document.getElementById('runs').innerHTML = table(runs, [['Stage', r => r.stage], ['Status', r => r.status], ['Rows', r => r.rows],
+    ['Finished', r => r.finished_at?.slice(11, 19)], ['Detail', r => `<code>${esc(r.detail).slice(0, 110)}</code>`]]);
+  document.getElementById('dlq').innerHTML = dlq.length ? table(dlq, [['Payload', r => `<code>${esc(r.payload).slice(0, 120)}</code>`],
+    ['Error', r => `<code>${esc(r.error).slice(0, 120)}</code>`]]) : '<p class="muted">empty</p>';
+}
+document.getElementById('run').onclick = async e => {
+  e.target.disabled = true; document.getElementById('runout').textContent = 'running…';
+  const r = await j('/pipeline/run?simulate=500', {method: 'POST'});
+  document.getElementById('runout').textContent = `inserted ${r.consumed.inserted}, duplicates ${r.consumed.duplicates}, dead-lettered ${r.consumed.dead_lettered}`;
+  await load(); e.target.disabled = false;
+};
+load();
+</script>
+</body>
+</html>
