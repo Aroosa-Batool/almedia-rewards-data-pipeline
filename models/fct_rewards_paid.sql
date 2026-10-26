@@ -1,7 +1,7 @@
 -- materialized: incremental
 -- unique_key: event_id
--- Only new rows since the last run are processed (watermark on ingested_at).
--- Re-running is safe: rows are upserted on unique_key.
+-- Only rows ingested since the last watermark (minus a safety lookback) are processed.
+-- Upserting on unique_key makes the overlap harmless.
 SELECT
     event_id,
     user_id,

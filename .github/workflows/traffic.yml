@@ -1,0 +1,14 @@
+# Live traffic: a producer service sends a batch of events to production every hour.
+name: producer
+on:
+  schedule: [{ cron: "17 * * * *" }]
+  workflow_dispatch:
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+      - run: python -m pipeline.cli send --url https://almedia-rewards-pipeline.vercel.app --key "${{ secrets.PRODUCER_API_KEY }}" --events 400

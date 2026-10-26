@@ -1,55 +1,91 @@
-"""Database connection helpers.
+"""Postgres connection + a minimal, versioned migration runner.
 
-One SQLite file holds both the operational tables and the warehouse marts.
-In production these would be separate systems (e.g. Postgres + BigQuery/Snowflake).
+All objects live in one Postgres schema (DB_SCHEMA, default "rewards"), so several
+services can share a database without colliding.
 """
 from __future__ import annotations
 
+import json
 import os
-import sqlite3
-from contextlib import contextmanager
-from datetime import datetime, timezone
+import re
+from datetime import datetime
 from pathlib import Path
-from typing import Iterator
 
-SCHEMA = Path(__file__).with_name("schema.sql")
+import psycopg
+from psycopg import sql
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
-
-def default_path() -> str:
-    # Vercel's filesystem is read-only except /tmp.
-    return os.environ.get("PIPELINE_DB", "/tmp/rewards.db" if os.environ.get("VERCEL") else "rewards.db")
-
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+MIGRATIONS = Path(__file__).resolve().parent.parent / "migrations"
+SCHEMA_NAME = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
 
-def connect(path: str | None = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(path or default_path(), isolation_level=None, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    # WAL lets readers (the API) keep reading while the writer (the pipeline) writes.
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.executescript(SCHEMA.read_text())
+def database_url() -> str:
+    # The direct (unpooled) endpoint: we use session state (search_path) and advisory locks.
+    url = os.environ.get("DATABASE_URL_UNPOOLED") or os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set")
+    return url
+
+
+def _schema(schema: str | None) -> str:
+    schema = schema or os.environ.get("DB_SCHEMA", "rewards")
+    if not SCHEMA_NAME.match(schema):
+        raise ValueError(f"invalid schema name {schema!r}")
+    return schema
+
+
+def _configure(schema: str):
+    def configure(conn: psycopg.Connection) -> None:
+        conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))
+        conn.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
+    return configure
+
+
+def connect(schema: str | None = None, url: str | None = None) -> psycopg.Connection:
+    """A single connection (CLI, tests)."""
+    conn = psycopg.connect(url or database_url(), row_factory=dict_row, connect_timeout=10, autocommit=True)
+    _configure(_schema(schema))(conn)
+    migrate(conn)
     return conn
 
 
-@contextmanager
-def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """Explicit BEGIN/COMMIT so a batch is all-or-nothing."""
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        yield conn
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    else:
-        conn.execute("COMMIT")
-
-
-def record_run(conn: sqlite3.Connection, stage: str, started_at: str, status: str, rows: int = 0, detail: str = "") -> None:
-    conn.execute(
-        "INSERT INTO pipeline_runs (stage, started_at, finished_at, status, rows, detail) VALUES (?,?,?,?,?,?)",
-        (stage, started_at, utcnow(), status, rows, detail),
+def make_pool(schema: str | None = None, url: str | None = None, max_size: int = 4) -> ConnectionPool:
+    """A small pool for the API: each request thread gets its own connection, so
+    transactions from concurrent requests never interleave on one socket."""
+    pool = ConnectionPool(
+        url or database_url(), min_size=1, max_size=max_size, open=True, check=ConnectionPool.check_connection,
+        kwargs={"row_factory": dict_row, "autocommit": True, "connect_timeout": 10},
+        configure=_configure(_schema(schema)),
     )
+    with pool.connection() as conn:
+        migrate(conn)
+    return pool
+
+
+def migrate(conn: psycopg.Connection) -> list[str]:
+    """Apply migrations/NNN_*.sql in order, once each. A lock stops two cold starts racing."""
+    applied: list[str] = []
+    with conn.transaction():
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(current_schema() || ':migrate'))")
+        conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations "
+                     "(version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+        done = {r["version"] for r in conn.execute("SELECT version FROM schema_migrations")}
+        for f in sorted(MIGRATIONS.glob("*.sql")):
+            if f.stem not in done:
+                conn.execute(f.read_text())
+                conn.execute("INSERT INTO schema_migrations (version) VALUES (%s)", (f.stem,))
+                applied.append(f.stem)
+    return applied
+
+
+def record_run(conn: psycopg.Connection, stage: str, started_at: datetime, status: str,
+               rows: int = 0, detail: dict | None = None) -> None:
+    conn.execute(
+        "INSERT INTO pipeline_runs (stage, started_at, status, rows, detail) VALUES (%s,%s,%s,%s,%s)",
+        (stage, started_at, status, rows, json.dumps(detail or {}, default=str)),
+    )
+
+
+def now(conn: psycopg.Connection) -> datetime:
+    return conn.execute("SELECT clock_timestamp() AS t").fetchone()["t"]

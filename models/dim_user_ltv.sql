@@ -1,5 +1,5 @@
 -- materialized: table
--- Lifetime value per user, with a simple segment. Window function ranks users per country.
+-- Lifetime value per user + segment + rank within country (window function).
 SELECT
     user_id,
     country,
@@ -13,11 +13,11 @@ SELECT
     RANK() OVER (PARTITION BY country ORDER BY lifetime_cents DESC) AS country_rank
 FROM (
     SELECT user_id,
-           MAX(country)       AS country,
-           SUM(reward_cents)  AS lifetime_cents,
-           COUNT(*)           AS rewards,
-           MIN(occurred_at)   AS first_paid_at,
-           MAX(occurred_at)   AS last_paid_at
+           MODE() WITHIN GROUP (ORDER BY country) AS country,
+           SUM(reward_cents)::bigint             AS lifetime_cents,
+           COUNT(*)                               AS rewards,
+           MIN(occurred_at)                       AS first_paid_at,
+           MAX(occurred_at)                       AS last_paid_at
     FROM {{ ref('fct_rewards_paid') }}
     GROUP BY user_id
-)
+) per_user

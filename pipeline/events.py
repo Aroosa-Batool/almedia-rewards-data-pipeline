@@ -10,6 +10,7 @@ import random
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -19,12 +20,12 @@ ADVERTISERS = ["RaidQuest", "CoinMaster", "FarmLand", "ShopNow", "BankPlus"]
 
 
 class RewardEvent(BaseModel):
-    event_id: str = Field(min_length=8)
+    event_id: UUID
     event_type: EventType
     user_id: str = Field(min_length=1)
     offer_id: str = Field(min_length=1)
     advertiser: str
-    country: str = Field(min_length=2, max_length=2)
+    country: str = Field(pattern=r"^[A-Za-z]{2}$")
     reward_cents: int = Field(default=0, ge=0, le=100_000)
     occurred_at: datetime
 

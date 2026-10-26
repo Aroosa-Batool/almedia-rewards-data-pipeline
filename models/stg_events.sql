@@ -1,5 +1,5 @@
 -- materialized: view
--- Staging: one clean row per event. Renames, casts and derived columns only, no business logic.
+-- Staging: one clean row per event. Renames, casts and derived columns only.
 SELECT
     event_id,
     event_type,
@@ -9,7 +9,7 @@ SELECT
     country,
     reward_cents,
     occurred_at,
-    DATE(occurred_at)  AS event_date,
+    (occurred_at AT TIME ZONE 'UTC')::date                     AS event_date,
     ingested_at,
-    (JULIANDAY(ingested_at) - JULIANDAY(occurred_at)) * 24 * 60 AS arrival_delay_min
+    EXTRACT(EPOCH FROM ingested_at - occurred_at) / 60.0       AS arrival_delay_min
 FROM raw_events

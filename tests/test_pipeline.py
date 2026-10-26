@@ -1,13 +1,15 @@
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from pipeline import cli, quality, stream, transform
+from pipeline import auth, cli, quality, stream, transform
+from pipeline.db import migrate
 from pipeline.events import RewardEvent, generate
 
 
 def ev(**kw):
-    base = dict(event_id="e" * 10, event_type="reward_paid", user_id="u1", offer_id="o1",
+    base = dict(event_id=str(uuid.uuid4()), event_type="reward_paid", user_id="u1", offer_id="o1",
                 advertiser="A", country="de", reward_cents=100,
                 occurred_at=datetime.now(timezone.utc).isoformat())
     return {**base, **kw}
@@ -15,78 +17,81 @@ def ev(**kw):
 
 def test_contract_normalizes_and_rejects():
     assert RewardEvent.model_validate(ev()).country == "DE"
-    with pytest.raises(ValueError):
-        RewardEvent.model_validate(ev(reward_cents=0))            # paid without reward
-    with pytest.raises(ValueError):
-        RewardEvent.model_validate(ev(occurred_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()))
+    for bad in (dict(reward_cents=0), dict(event_id="not-a-uuid"), dict(country="DEU"),
+                dict(occurred_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())):
+        with pytest.raises(ValueError):
+            RewardEvent.model_validate(ev(**bad))
+
+
+def test_migrations_are_idempotent(conn):
+    assert migrate(conn) == []
 
 
 def test_duplicates_are_idempotent(conn):
-    stream.produce(conn, [ev(), ev(), ev()])                   # producer retried twice
+    e = ev()
+    stream.produce(conn, [e, e, e])                         # producer retried twice
     stats = stream.consume(conn)
-    assert stats == {"read": 3, "inserted": 1, "duplicates": 2, "dead_lettered": 0}
-    assert conn.execute("SELECT COUNT(*) FROM raw_events").fetchone()[0] == 1
+    assert (stats["read"], stats["inserted"], stats["duplicates"]) == (3, 1, 2)
 
 
-def test_bad_record_goes_to_dead_letter_not_crash(conn):
-    stream.produce(conn, [ev(event_id="good-event-1"), ev(event_id="bad-event-1", country="")])
+def test_bad_record_goes_to_dead_letter(conn):
+    stream.produce(conn, [ev(), ev(country="")])
     stats = stream.consume(conn)
     assert stats["inserted"] == 1 and stats["dead_lettered"] == 1
+    assert conn.execute("SELECT error FROM dead_letter_events").fetchone()["error"]
 
 
-def test_offsets_commit_so_replay_does_not_reprocess(conn):
-    stream.produce(conn, generate(200, seed=1))
-    first = stream.consume(conn)
-    again = stream.consume(conn)
-    assert first["read"] == 200 and again["read"] == 0
+def test_offsets_commit_and_lag_drops_to_zero(conn):
+    stream.produce(conn, generate(300, seed=1))
+    assert sum(stream.lag(conn).values()) == 300
+    first = stream.drain(conn)
+    assert first["read"] == 300 and stream.consume(conn)["read"] == 0
     assert sum(stream.lag(conn).values()) == 0
 
 
+def test_partition_is_locked_while_another_consumer_holds_it(conn, schema):
+    from pipeline.db import connect
+    stream.produce(conn, generate(50, seed=2))
+    other = connect(schema)
+    with other.transaction():
+        other.execute("SELECT pg_advisory_xact_lock(hashtext(%s), %s)", (stream.GROUP, 0))
+        stats = stream.consume(conn)
+    other.close()
+    assert stats["skipped_locked"] == 1
+
+
 def test_same_user_same_partition():
-    a, b = RewardEvent.model_validate(ev(event_id="x" * 9)), RewardEvent.model_validate(ev(event_id="y" * 9))
-    assert a.partition() == b.partition()
+    assert stream.partition_for(ev()) == stream.partition_for(ev())
 
 
 def test_dag_order_and_cycle_detection():
     models = transform.load_models()
     order = transform.run_order(models)
     assert order.index("stg_events") < order.index("fct_rewards_paid") < order.index("mart_advertiser_daily")
-    models["stg_events"].deps.add("dim_user_ltv")              # introduce a cycle
+    models["stg_events"].deps.add("dim_user_ltv")
     with pytest.raises(ValueError, match="cycle"):
         transform.run_order(models)
 
 
-def test_incremental_only_processes_new_rows(conn):
-    cli.run(conn, events=500, seed=3)
-    first = conn.execute("SELECT rows_written FROM model_state WHERE model_name='fct_rewards_paid'").fetchone()[0]
-    assert first > 0
-    transform.run_all(conn)                                    # no new data
-    assert conn.execute("SELECT rows_written FROM model_state WHERE model_name='fct_rewards_paid'").fetchone()[0] == 0
-
-
-def test_full_refresh_equals_incremental(conn):
-    cli.run(conn, events=800, seed=4)
-    cli.run(conn, events=800, seed=5)
-    inc = conn.execute("SELECT COUNT(*), SUM(reward_cents) FROM fct_rewards_paid").fetchone()
+def test_incremental_equals_full_refresh(conn):
+    cli.run(conn, simulate=600)
+    cli.run(conn, simulate=600)
+    inc = conn.execute("SELECT COUNT(*) AS n, SUM(reward_cents) AS s FROM fct_rewards_paid").fetchone()
     transform.run_all(conn, full_refresh=True)
-    full = conn.execute("SELECT COUNT(*), SUM(reward_cents) FROM fct_rewards_paid").fetchone()
-    assert tuple(inc) == tuple(full)
+    full = conn.execute("SELECT COUNT(*) AS n, SUM(reward_cents) AS s FROM fct_rewards_paid").fetchone()
+    assert inc == full and inc["n"] > 0
 
 
-def test_quality_checks_pass_on_clean_run(conn):
-    cli.run(conn, events=1000, seed=6)
-    res = quality.run_checks(conn)
-    assert res["passed"], [c for c in res["checks"] if c["status"] != "pass"]
+def test_quality_passes_then_catches_reconciliation_break(conn):
+    assert cli.run(conn, simulate=800)["quality_passed"]
+    conn.execute("UPDATE mart_advertiser_daily SET payout_cents = payout_cents + 1 "
+                 "WHERE ctid = (SELECT ctid FROM mart_advertiser_daily LIMIT 1)")
+    assert not quality.run_checks(conn)["passed"]
 
 
-def test_quality_catches_reconciliation_break(conn):
-    cli.run(conn, events=1000, seed=7)
-    conn.execute("UPDATE mart_advertiser_daily SET payout_cents = payout_cents + 1 WHERE rowid = 1")
-    res = quality.run_checks(conn)
-    assert not res["passed"]
-
-
-def test_user_lookup_uses_index(conn):
-    plan = " ".join(r["detail"] for r in conn.execute(
-        "EXPLAIN QUERY PLAN SELECT * FROM raw_events WHERE user_id='u1' ORDER BY occurred_at DESC"))
-    assert "ix_raw_events_user_time" in plan
+def test_api_keys(conn):
+    key = auth.create_producer(conn, "game-backend")
+    assert auth.authenticate(conn, key) and not auth.authenticate(conn, key + "x")
+    assert conn.execute("SELECT key_hash FROM producers").fetchone()["key_hash"] != key
+    auth.revoke(conn, "game-backend")
+    assert auth.authenticate(conn, key) is None

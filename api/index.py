@@ -1,126 +1,190 @@
-"""HTTP layer: ingestion API + read API over the marts + a live dashboard.
+"""HTTP API + dashboard.
 
-Run locally:  uvicorn api.index:app --reload
-On Vercel this file is the serverless function; vercel.json routes every path here.
+Write path:  POST /v1/events (API key) -> event_log -> micro-batch consume -> raw_events
+Read path:   marts are refreshed lazily when older than REFRESH_SECONDS, plus a scheduled run.
+
+Local:  uvicorn api.index:app --reload
 """
 from __future__ import annotations
 
+import os
 import sys
 import threading
 from pathlib import Path
+from typing import Annotated, Iterator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fastapi import FastAPI, HTTPException, Query  # noqa: E402
+import psycopg  # noqa: E402
+from fastapi import Depends, FastAPI, Header, HTTPException, Query  # noqa: E402
 from fastapi.responses import HTMLResponse  # noqa: E402
 
-from pipeline import cli, quality, stream, transform  # noqa: E402
-from pipeline.db import connect  # noqa: E402
-from pipeline.events import RewardEvent  # noqa: E402
+from pipeline import auth, quality, stream, transform  # noqa: E402
+from pipeline.db import make_pool  # noqa: E402
+from pipeline.events import RewardEvent, generate  # noqa: E402
 
-app = FastAPI(title="Rewards Data Pipeline", version="1.0.0",
-              description="Ingestion -> stream -> raw -> dbt-style marts -> data-quality checks")
+REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "120"))
+DEMO_COOLDOWN_SECONDS = 30
+MAX_BATCH = 1000
 
-_conn = connect()
-_lock = threading.Lock()  # SQLite has one writer; serialize writes inside this process
+app = FastAPI(
+    title="RewardStream",
+    version="1.1.0",
+    description="Event ingestion and analytics for rewarded advertising: offer clicks, completions and payouts.",
+)
 
-# Serverless instances start empty: seed demo data on cold start so the dashboard has content.
-if _conn.execute("SELECT COUNT(*) FROM raw_events").fetchone()[0] == 0:
+_pool = None
+_lock = threading.Lock()
+
+
+def db() -> Iterator[psycopg.Connection]:
+    """Created lazily so importing the app never needs the network; reused while the instance is warm."""
+    global _pool
     with _lock:
-        cli.run(_conn, events=3000, seed=42)
+        if _pool is None:
+            _pool = make_pool()
+    with _pool.connection() as conn:
+        yield conn
 
 
-def rows(sql: str, params: tuple = ()) -> list[dict]:
-    return [dict(r) for r in _conn.execute(sql, params).fetchall()]
+Conn = Annotated[psycopg.Connection, Depends(db)]
+
+
+def rows(conn: psycopg.Connection, q: str, params: tuple = ()) -> list[dict]:
+    return conn.execute(q, params).fetchall()
+
+
+def ensure_fresh(conn: psycopg.Connection) -> None:
+    age = transform.seconds_since_last_run(conn)
+    if age is None or age > REFRESH_SECONDS:
+        stream.drain(conn)
+        if transform.run_all(conn) is not None:
+            quality.run_checks(conn)
+
+
+def require_producer(conn: Conn, x_api_key: Annotated[str | None, Header()] = None) -> int:
+    pid = auth.authenticate(conn, x_api_key)
+    if pid is None:
+        raise HTTPException(401, "missing or invalid X-API-Key")
+    return pid
 
 
 @app.get("/health")
-def health() -> dict:
-    return {"status": "ok", "raw_events": _conn.execute("SELECT COUNT(*) FROM raw_events").fetchone()[0]}
+def health(conn: Conn) -> dict:
+    r = conn.execute("SELECT COUNT(*) AS n, MAX(ingested_at) AS newest FROM raw_events").fetchone()
+    return {"status": "ok", "raw_events": r["n"], "newest_event_ingested_at": r["newest"],
+            "lag": sum(stream.lag(conn).values())}
 
 
-@app.post("/events", status_code=202)
-def ingest(events: list[dict]) -> dict:
-    """Accept a batch, append to the log (fast), return 202. Loading happens in the consumer.
+@app.post("/v1/events", status_code=202)
+def ingest(events: list[dict], conn: Conn, producer_id: Annotated[int, Depends(require_producer)]) -> dict:
+    """Append a batch to the log, then load a micro-batch.
 
-    Validation errors are NOT rejected here: they go to the dead-letter table during consume,
-    so one bad record never fails a whole batch from a producer.
+    Invalid events are NOT rejected here: they go to the dead-letter table during consume,
+    so one bad record never fails a producer's whole batch.
     """
-    if not events or len(events) > 1000:
-        raise HTTPException(422, "send 1..1000 events per request")
-    with _lock:
-        n = stream.produce(_conn, events)
-    return {"accepted": n, "lag": stream.lag(_conn)}
+    if not 1 <= len(events) <= MAX_BATCH:
+        raise HTTPException(422, f"send 1..{MAX_BATCH} events per request")
+    accepted = stream.produce(conn, events, producer_id)
+    consumed = stream.drain(conn, max_rounds=3)
+    return {"accepted": accepted, "consumed": consumed, "lag": stream.lag(conn)}
 
 
-@app.post("/events/validate")
+@app.post("/v1/events/validate")
 def validate(event: RewardEvent) -> dict:
-    """Synchronous contract check, handy for producers' CI."""
-    return {"valid": True, "partition": event.partition(stream.PARTITIONS)}
+    """Synchronous contract check for producers' CI pipelines."""
+    return {"valid": True, "partition": stream.partition_for(event.model_dump())}
 
 
-@app.post("/pipeline/run")
-def run_pipeline(simulate: int = Query(500, ge=0, le=5000), full_refresh: bool = False) -> dict:
-    """Simulate N new events, drain the stream, rebuild marts, run checks."""
-    with _lock:
-        return cli.run(_conn, events=simulate, full_refresh=full_refresh)
+@app.post("/v1/demo/traffic")
+def demo_traffic(conn: Conn) -> dict:
+    """Public, rate-limited: generates 300 synthetic events so visitors can watch the pipeline move."""
+    last = conn.execute("SELECT EXTRACT(EPOCH FROM now() - MAX(finished_at)) AS s FROM pipeline_runs "
+                        "WHERE stage = 'demo_traffic'").fetchone()["s"]
+    if last is not None and float(last) < DEMO_COOLDOWN_SECONDS:
+        raise HTTPException(429, f"demo traffic is limited to once every {DEMO_COOLDOWN_SECONDS}s")
+    # Claim the slot first so concurrent clicks can't both pass the check.
+    conn.execute("INSERT INTO pipeline_runs (stage, started_at, status, rows) VALUES ('demo_traffic', now(), 'success', 300)")
+    stream.produce(conn, generate(300))
+    consumed = stream.drain(conn)
+    models = transform.run_all(conn)
+    checks = quality.run_checks(conn)
+    return {"consumed": consumed, "models": models, "quality_passed": checks["passed"]}
 
 
-@app.get("/stream/lag")
-def lag() -> dict:
-    return stream.lag(_conn)
+@app.get("/api/cron/pipeline")
+def cron(conn: Conn, authorization: Annotated[str | None, Header()] = None) -> dict:
+    """Scheduled full run (Vercel Cron sends `Authorization: Bearer $CRON_SECRET`)."""
+    secret = os.environ.get("CRON_SECRET")
+    if not secret or authorization != f"Bearer {secret}":
+        raise HTTPException(401)
+    consumed = stream.drain(conn)
+    models = transform.run_all(conn)
+    return {"consumed": consumed, "models": models, "quality": quality.run_checks(conn)["passed"]}
 
 
-@app.get("/marts/advertisers")
-def advertisers(days: int = Query(7, ge=1, le=90)) -> list[dict]:
-    return rows(
-        """SELECT advertiser, SUM(rewards_paid) AS rewards_paid, SUM(payout_cents) AS payout_cents,
-                  SUM(paying_users) AS paying_users
-           FROM mart_advertiser_daily WHERE event_date >= DATE('now', ?)
-           GROUP BY advertiser ORDER BY payout_cents DESC""",
-        (f"-{days} days",),
-    )
+@app.get("/v1/stream/lag")
+def lag(conn: Conn) -> dict:
+    return stream.lag(conn)
 
 
-@app.get("/marts/daily")
-def daily() -> list[dict]:
-    return rows("SELECT event_date, SUM(payout_cents) AS payout_cents, SUM(rewards_paid) AS rewards_paid "
-                "FROM mart_advertiser_daily GROUP BY event_date ORDER BY event_date")
+@app.get("/v1/marts/advertisers")
+def advertisers(conn: Conn, days: int = Query(7, ge=1, le=90)) -> list[dict]:
+    ensure_fresh(conn)
+    return rows(conn, """SELECT advertiser, SUM(rewards_paid)::int AS rewards_paid, SUM(payout_cents)::bigint AS payout_cents,
+                                SUM(paying_users)::int AS paying_users
+                         FROM mart_advertiser_daily WHERE event_date >= current_date - %s
+                         GROUP BY advertiser ORDER BY payout_cents DESC""", (days,))
 
 
-@app.get("/marts/funnel")
-def funnel(limit: int = Query(10, ge=1, le=100)) -> list[dict]:
-    return rows("SELECT * FROM fct_offer_funnel ORDER BY clickers DESC LIMIT ?", (limit,))
+@app.get("/v1/marts/daily")
+def daily(conn: Conn, days: int = Query(14, ge=1, le=90)) -> list[dict]:
+    ensure_fresh(conn)
+    return rows(conn, """SELECT event_date, SUM(payout_cents)::bigint AS payout_cents, SUM(rewards_paid)::int AS rewards_paid
+                         FROM mart_advertiser_daily WHERE event_date >= current_date - %s
+                         GROUP BY event_date ORDER BY event_date""", (days,))
 
 
-@app.get("/users/{user_id}")
-def user(user_id: str) -> dict:
-    ltv = rows("SELECT * FROM dim_user_ltv WHERE user_id=?", (user_id,))
+@app.get("/v1/marts/funnel")
+def funnel(conn: Conn, limit: int = Query(10, ge=1, le=100)) -> list[dict]:
+    ensure_fresh(conn)
+    return rows(conn, "SELECT * FROM fct_offer_funnel ORDER BY clickers DESC, offer_id LIMIT %s", (limit,))
+
+
+@app.get("/v1/users/top")
+def top_users(conn: Conn, limit: int = Query(10, ge=1, le=100)) -> list[dict]:
+    ensure_fresh(conn)
+    return rows(conn, "SELECT * FROM dim_user_ltv ORDER BY lifetime_cents DESC LIMIT %s", (limit,))
+
+
+@app.get("/v1/users/{user_id}")
+def user(user_id: str, conn: Conn) -> dict:
+    ensure_fresh(conn)
+    ltv = rows(conn, "SELECT * FROM dim_user_ltv WHERE user_id = %s", (user_id,))
     if not ltv:
         raise HTTPException(404, "user has no paid rewards")
-    # This lookup uses ix_raw_events_user_time (see EXPLAIN in /debug/explain).
-    events = rows("SELECT event_type, offer_id, reward_cents, occurred_at FROM raw_events "
-                  "WHERE user_id=? ORDER BY occurred_at DESC LIMIT 20", (user_id,))
+    events = rows(conn, "SELECT event_type, offer_id, reward_cents, occurred_at FROM raw_events "
+                        "WHERE user_id = %s ORDER BY occurred_at DESC LIMIT 20", (user_id,))
     return {"ltv": ltv[0], "recent_events": events}
 
 
-@app.get("/quality")
-def checks() -> dict:
-    with _lock:
-        return quality.run_checks(_conn)
+@app.get("/v1/quality")
+def checks(conn: Conn) -> dict:
+    ensure_fresh(conn)
+    return quality.run_checks(conn, record=False)
 
 
-@app.get("/runs")
-def runs(limit: int = 20) -> list[dict]:
-    return rows("SELECT * FROM pipeline_runs ORDER BY id DESC LIMIT ?", (limit,))
+@app.get("/v1/runs")
+def runs(conn: Conn, limit: int = Query(20, ge=1, le=200)) -> list[dict]:
+    return rows(conn, "SELECT * FROM pipeline_runs ORDER BY id DESC LIMIT %s", (limit,))
 
 
-@app.get("/dead-letters")
-def dead_letters(limit: int = 20) -> list[dict]:
-    return rows("SELECT * FROM dead_letter_events ORDER BY id DESC LIMIT ?", (limit,))
+@app.get("/v1/dead-letters")
+def dead_letters(conn: Conn, limit: int = Query(20, ge=1, le=200)) -> list[dict]:
+    return rows(conn, "SELECT * FROM dead_letter_events ORDER BY id DESC LIMIT %s", (limit,))
 
 
-@app.get("/lineage")
+@app.get("/v1/lineage")
 def lineage() -> dict:
     models = transform.load_models()
     return {"order": transform.run_order(models),
@@ -128,12 +192,6 @@ def lineage() -> dict:
             "materializations": {m.name: m.materialized for m in models.values()}}
 
 
-@app.get("/debug/explain")
-def explain() -> dict:
-    q = "SELECT * FROM raw_events WHERE user_id='u0001' ORDER BY occurred_at DESC LIMIT 20"
-    return {"query": q, "plan": [r["detail"] for r in rows("EXPLAIN QUERY PLAN " + q)]}
-
-
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> str:
-    return (Path(__file__).with_name("dashboard.html")).read_text()
+    return Path(__file__).with_name("dashboard.html").read_text()

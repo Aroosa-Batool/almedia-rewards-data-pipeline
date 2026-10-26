@@ -1,4 +1,3 @@
 {
-  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }],
-  "functions": { "api/index.py": { "includeFiles": "{pipeline,models,api}/**" } }
+  "crons": [{ "path": "/api/cron/pipeline", "schedule": "0 3 * * *" }]
 }
